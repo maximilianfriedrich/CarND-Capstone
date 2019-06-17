@@ -29,6 +29,7 @@ LOOKAHEAD_WPS = 200 # Number of waypoints we will publish. You can change this n
 MAX_DECEL = 4.0
 SPEED_LIMIT = 20.0
 
+
 class WaypointUpdater(object):
     def __init__(self):
         rospy.init_node('waypoint_updater')
@@ -124,6 +125,7 @@ class WaypointUpdater(object):
         return temp
 
 
+
     def decelerate_waypoints(self, waypoints, closest_idx):
         temp = []
         for i, wp in enumerate(waypoints):
@@ -157,6 +159,7 @@ class WaypointUpdater(object):
 
     def velocity_cb(self, msg):
         self.current_vel = msg.twist.linear.x
+
 
     def traffic_cb(self, msg):
         # TODO: Callback for /traffic_waypoint message. Implement
