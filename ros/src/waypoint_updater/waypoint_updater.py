@@ -1,14 +1,13 @@
 #!/usr/bin/env python
 
 import rospy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Quaternion
 from styx_msgs.msg import Lane, Waypoint
 from std_msgs.msg import Int32
-from scipy.spatial import KDTree
-from geometry_msgs.msg import TwistStamped
 
 import math
 import numpy as np
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
 
 '''
 This node will publish waypoints from the car's current position to some `x` distance ahead.
@@ -26,162 +25,213 @@ TODO (for Yousuf and Aaron): Stopline location for each traffic light.
 '''
 
 LOOKAHEAD_WPS = 200 # Number of waypoints we will publish. You can change this number
-MAX_DECEL = 4.0
-SPEED_LIMIT = 20.0
+DECELERATION = 2.0 # Absolute value of planned deceleration in m/s^2
+DISTANCE_TOLERANCE_ZERO_SPEED = 2.
+DISTANCE_TOLERANCE_ONE_SPEED = 3.
 
 
 class WaypointUpdater(object):
     def __init__(self):
         rospy.init_node('waypoint_updater')
 
+
+        self.c_max_velocity = rospy.get_param('waypoint_loader/velocity', 40.) / 3.6
+
+
         rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
         rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
-        rospy.Subscriber('/current_velocity', TwistStamped, self.velocity_cb)
-
-        # TODO: Add a subscriber for /traffic_waypoint and /obstacle_waypoint below
         rospy.Subscriber('/traffic_waypoint', Int32, self.traffic_cb)
-
-        self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
-
-        # TODO: Add other member variables you need below
-        self.pose = None
-        self.base_waypoints = None
-        self.waypoints_2d = None
-        self.waypoint_tree = None
-
-        self.current_vel = None
-
-        self.stopline_wp_idx = -1
-
-        self.loop()
-
-    def loop(self):
-        rate = rospy.Rate(50)
-        while not rospy.is_shutdown():
-            if self.pose and self.base_waypoints:
-                self.publish_waypoints()
-
-        rate.sleep()
-
-    def get_closest_waypoint_idx(self):
-        x = self.pose.pose.position.x
-        y = self.pose.pose.position.y
-        closest_idx = self.waypoint_tree.query([x, y], 1)[1]
-
-        closest_coord = self.waypoints_2d[closest_idx]
-        prev_coord = self.waypoints_2d[closest_idx-1]
-
-        cl_vec = np.array(closest_coord)
-        prev_vec = np.array(prev_coord)
-        pos_vec = np.array([x, y])
-
-        val = np.dot(cl_vec - prev_vec, pos_vec - cl_vec)
-
-        if val > 0:
-            closest_idx = (closest_idx + 1) % len(self.waypoints_2d)
-        return closest_idx
+        rospy.Subscriber('/obstacle_waypoint', Int32, self.obstacle_cb)
 
 
-    def publish_waypoints(self):
-        final_lane = self.generate_lane()
-        self.final_waypoints_pub.publish(final_lane)
-
-    def generate_lane(self):
-        lane = Lane()
-
-        closest_idx = self.get_closest_waypoint_idx()
-        farthest_idx = closest_idx + LOOKAHEAD_WPS
-        base_waypoints = self.base_waypoints.waypoints[closest_idx : farthest_idx]
-        base_waypoints = self.accelerate_waypoints(base_waypoints)
-
-        if self.stopline_wp_idx == -1 or (self.stopline_wp_idx >= farthest_idx):
-            # Normal forward
-            lane.waypoints = base_waypoints
-        else:
-            # Make waypoints decelerate
-            lane.waypoints = self.decelerate_waypoints(base_waypoints, closest_idx)
-
-        return lane
-
-    def accelerate_waypoints(self, waypoints):
-        if not self.pose or not self.current_vel:
-            return waypoints
-
-        temp = []
-        v0 = self.current_vel
-        dl = lambda a, b: math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
-        first_dist = dl(self.pose.pose.position, waypoints[0].pose.pose.position)
-        for i, wp in enumerate(waypoints):
-            p = Waypoint()
-            p.pose = wp.pose
-
-            dist = self.distance(waypoints, 0, i)
-            
-            vel = math.sqrt(2*MAX_DECEL*dist + v0*v0) + first_dist
-
-            p.twist.twist.linear.x = min(SPEED_LIMIT, vel)
-            temp.append(p)
-
-        return temp
+        self.final_waypoints_pub = rospy.Publisher('/final_waypoints', Lane, queue_size=1)
 
 
+        self.waypoints_base = None
+        self.closet_wp_idx = 0
 
-    def decelerate_waypoints(self, waypoints, closest_idx):
-        temp = []
-        for i, wp in enumerate(waypoints):
-            p = Waypoint()
-            p.pose = wp.pose
+        self.stop_line_wp_idx = -1
+        self.waypoints_decelareted = []
 
-            stop_idx = max(self.stopline_wp_idx - closest_idx - 3, 0)
-            dist = self.distance(waypoints, i, stop_idx)
-            vel = math.sqrt(2 * MAX_DECEL * dist)
-            if vel < 1.:
-                vel = 0.
-
-            p.twist.twist.linear.x = min(vel, wp.twist.twist.linear.x)
-            temp.append(p)
-
-        return temp
+        rospy.spin()
 
     def pose_cb(self, msg):
-        # TODO: Implement
-        self.pose = msg
+        if self.waypoints_base is not None:
+
+            min_dist = 100000.0
+            min_idx  = self.closet_wp_idx
+
+            prev_closet_wp_idx = self.closet_wp_idx
+            start_idx = self.closet_wp_idx - 2
+
+
+            if (start_idx < 0):
+                start_idx = start_idx + len(self.waypoints_base.waypoints)
+
+            for i in range(start_idx, start_idx + len(self.waypoints_base.waypoints)):
+                idx = i % len(self.waypoints_base.waypoints)
+                cur_dist = self.eucl_dist_3d(msg.pose.position, self.waypoints_base.waypoints[idx].pose.pose.position)
+
+                if (cur_dist < min_dist):
+                    min_dist = cur_dist
+                    min_idx  = idx
+
+                if (min_dist < 5 and cur_dist > 10 * min_dist):
+                    break
+
+            delta_x = self.waypoints_base.waypoints[min_idx].pose.pose.position.x - msg.pose.position.x
+            delta_y = self.waypoints_base.waypoints[min_idx].pose.pose.position.y - msg.pose.position.y
+
+            heading = np.arctan2(delta_y, delta_x)
+            (roll, pitch, yaw) = self.get_roll_pitch_yaw(msg.pose.orientation)
+            angle = np.abs(yaw - heading)
+            angle = np.minimum(angle, 2.0 * np.pi - angle)
+            if (angle > np.pi / 4.0):
+                self.closet_wp_idx = (min_idx + 1) % len(self.waypoints_base.waypoints)
+            else:
+                self.closet_wp_idx = min_idx
+
+            if prev_closet_wp_idx != self.closet_wp_idx:
+              self.publish_waypoints()
+              wp = self.waypoints_base.waypoints[self.closet_wp_idx]
+              waypoint_pos = wp.pose.pose.position
+              waypoint_speed = wp.twist.twist.linear.x
+        pass
+
+    def publish_waypoints(self):
+        if self.waypoints_base is not None:
+            lane = Lane()
+            lane.header = self.waypoints_base.header
+
+            idx = self.closet_wp_idx
+            wp = self.waypoints_base.waypoints
+
+            lane.waypoints = wp[idx: min(idx + LOOKAHEAD_WPS, len(wp))]
+            size = len(lane.waypoints)
+            if size < LOOKAHEAD_WPS:
+                lane.waypoints += wp[:LOOKAHEAD_WPS - size]
+
+            self.final_waypoints_pub.publish(lane)
+
+        pass
 
     def waypoints_cb(self, waypoints):
-        # TODO: Implement
-        self.base_waypoints = waypoints
-        if not self.waypoints_2d:
-            global SPEED_LIMIT
-            SPEED_LIMIT = self.base_waypoints.waypoints[0].twist.twist.linear.x
-            self.waypoints_2d = [[waypoint.pose.pose.position.x, waypoint.pose.pose.position.y] for waypoint in waypoints.waypoints]
-            self.waypoint_tree = KDTree(self.waypoints_2d)
+        self.waypoints_base = waypoints
 
+        for wp in self.waypoints_base.waypoints:
+            if self.get_waypoint_velocity(wp) > self.c_max_velocity:
+                wp.twist.twist.linear.x = self.c_max_velocity
 
-    def velocity_cb(self, msg):
-        self.current_vel = msg.twist.linear.x
-
+        pass
 
     def traffic_cb(self, msg):
-        # TODO: Callback for /traffic_waypoint message. Implement
-        self.stopline_wp_idx = msg.data
+        rospy.loginfo('waypoint_updater : traffic waypoint index %i', msg.data)
+        self.stop_line_wp_idx = msg.data
+        self.decelerate_waypoints()
+        pass
 
     def obstacle_cb(self, msg):
         # TODO: Callback for /obstacle_waypoint message. We will implement it later
         pass
 
+    def decelerate_waypoints(self):
+        if None is self.waypoints_base:
+          return    
+		  
+        self.stop_line_wp_idx = self.stop_line_wp_idx-2
+        wps = self.waypoints_base.waypoints
+        
+
+        if (self.stop_line_wp_idx != -1) and (0 == len(self.waypoints_decelareted)):
+
+
+            decel = DECELERATION
+            speed = self.get_waypoint_velocity(wps[self.closet_wp_idx])
+            decel_time = (speed - 1.) / decel
+            decel_dist = 0.5 * decel * decel_time * decel_time
+            dist_to_tfl = self.distance(self.closet_wp_idx, self.stop_line_wp_idx)
+            dist_to_tfl_safe = dist_to_tfl + DISTANCE_TOLERANCE_ONE_SPEED
+
+
+            distance_wp_tl = 0.
+
+            wp_idx = self.stop_line_wp_idx
+            prev_wp_idx = self.stop_line_wp_idx
+
+            while distance_wp_tl < decel_dist:
+              current_wp_speed = self.get_waypoint_velocity(wps[wp_idx])
+              self.waypoints_decelareted.append( [wp_idx, current_wp_speed])
+
+              distance_wp_tl = self.eucl_dist_3d(wps[self.stop_line_wp_idx].pose.pose.position, wps[prev_wp_idx].pose.pose.position)
+
+              wp_speed = 0.
+              if distance_wp_tl < DISTANCE_TOLERANCE_ZERO_SPEED:
+                wp_speed = 0.
+              elif distance_wp_tl < DISTANCE_TOLERANCE_ONE_SPEED:
+                wp_speed = 1.
+              else :
+                assert(prev_wp_idx != wp_idx)
+                wp_time = math.sqrt(2. * distance_wp_tl / decel)
+                wp_speed = min( (1. + wp_time * decel)\
+                                , self.c_max_velocity)
+
+              self.set_waypoint_velocity(wps, wp_idx, wp_speed)
+              prev_wp_idx = wp_idx
+
+              wp_idx = self.prev_waypoint(wp_idx)
+
+        elif (self.stop_line_wp_idx == -1):
+
+
+          if 0 != len(self.waypoints_decelareted):
+            for idx in self.waypoints_decelareted:
+              self.set_waypoint_velocity(wps, idx[0], idx[1])
+
+            self.waypoints_decelareted = []
+            self.publish_waypoints()
+            
+        return
+
     def get_waypoint_velocity(self, waypoint):
         return waypoint.twist.twist.linear.x
 
-    def set_waypoint_velocity(self, waypoints, waypoint, velocity):
-        waypoints[waypoint].twist.twist.linear.x = velocity
+    def set_waypoint_velocity(self, waypoints, wp_idx, velocity):
+        waypoints[wp_idx].twist.twist.linear.x = velocity
+        pass
+        
+    def next_waypoint(self, wp_idx):
+        if self.waypoints_base is not None:
+            return (wp_idx+1) % len(self.waypoints_base.waypoints)
+        return wp_idx
 
-    def distance(self, waypoints, wp1, wp2):
+    def prev_waypoint(self, wp_idx):
+        if self.waypoints_base is not None:
+            return (wp_idx-1) % len(self.waypoints_base.waypoints)
+        return wp_idx
+
+    def eucl_dist_3d(self, a, b):
+        return math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2  + (a.z-b.z)**2)
+
+    def distance(self, wp_idx_first, wp_idx_last):
+        if self.waypoints_base is None:
+            return 0
         dist = 0
-        dl = lambda a, b: math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2  + (a.z-b.z)**2)
-        for i in range(wp1, wp2+1):
-            dist += dl(waypoints[wp1].pose.pose.position, waypoints[i].pose.pose.position)
-            wp1 = i
+
+        all_wp_length = len(self.waypoints_base.waypoints)
+        if(wp_idx_first < wp_idx_last):
+            wp_idx_distance = wp_idx_last-wp_idx_first
+        else:
+            wp_idx_distance = all_wp_length - wp_idx_first + wp_idx_last
+
+        for i in range(wp_idx_first, (wp_idx_first+wp_idx_distance)):
+            idx = i % all_wp_length
+            next_idx = (idx + 1) % all_wp_length
+            dist += self.eucl_dist_3d(self.waypoints_base.waypoints[idx].pose.pose.position, self.waypoints_base.waypoints[next_idx].pose.pose.position)
         return dist
+
+    def get_roll_pitch_yaw(self, ros_quaternion):
+        orientation = [ros_quaternion.x, ros_quaternion.y, ros_quaternion.z, ros_quaternion.w]
+        return euler_from_quaternion(orientation)
 
 
 if __name__ == '__main__':
