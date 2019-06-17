@@ -33,34 +33,21 @@ class Controller(object):
         self.wheel_radius = wheel_radius
 
         self.last_time = rospy.get_time()
+        
+        self.pid_throttle = PID(0.35,0.0,0.0,0.0,1.0)
+        self.pid_brake = PID(0.5,0.0,0.0,0.0,1.0)
+        #Low pass filter for steering cmd
+        self.lowpass_steer = LowPassFilter(0.2,1.0)
 
 
     def control(self, dbw_enabled, current_vel, linear_vel, angular_vel):
         # TODO: Change the arg, kwarg list to suit your needs
-        if not dbw_enabled:
-            self.throttle_controller.reset()
-            return 0., 0., 0.
+        steer = self.yaw_controller.get_steering(target_speed, target_angular_speed, current_speed)
+        steer = self.lowpass_steer.filt(steer)
 
-        # Return throttle, brake, steer
-        steering = self.yaw_controller.get_steering(linear_vel, angular_vel, current_vel)
+        cte = target_speed - current_speed
+        throttle = self.pid_throttle.step(cte, time_elapsed)
+        brake = self.pid_brake.step(-cte, time_elapsed)
 
-        vel_error = linear_vel - current_vel
-        self.last_vel = current_vel
-
-        current_time = rospy.get_time()
-        sample_time = current_time - self.last_time
-        self.last_time = current_time
-
-        throttle = self.throttle_controller.step(vel_error, sample_time)
-        brake = 0
-
-        if linear_vel == 0. and current_vel < .1:
-            throttle = 0
-            brake = 700
-        elif throttle < .1 and vel_error < 0:
-            throttle = 0
-            decel= max(vel_error, self.decel_limit)
-            brake = abs(decel) * self.vehicle_mass * self.wheel_radius
-
-
-        return throttle, brake, steering
+        # return 0.3, 0., steer
+        return throttle, brake, steer
