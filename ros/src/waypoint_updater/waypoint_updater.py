@@ -59,10 +59,10 @@ class WaypointUpdater(object):
         rate = rospy.Rate(50)
         while not rospy.is_shutdown():
             if self.pose and self.base_waypoints:
-				closest_waypoints_idx= self. get_closest_waypoint_idx()
+                closest_waypoints_idx= self. get_closest_waypoint_idx()
                 self.publish_waypoints(closest_waypoints_idx)
 
-			rate.sleep()
+            rate.sleep()
 
     def get_closest_waypoint_idx(self):
         x = self.pose.pose.position.x
@@ -84,12 +84,12 @@ class WaypointUpdater(object):
 
 
     def publish_waypoints(self,closest_idx):
-		lane=Lane()
-		lane.header=self.basewaypoints.header
-		lane.waypoints=self.base_waypoints.waypoints[closest_idx : closest_idx + LOOKAHEAD_WPS]
-		self.final_waypoints_pub.publish(lane)
-        #final_lane = self.generate_lane()
-     #   self.final_waypoints_pub.publish(final_lane)
+        lane=Lane()
+        lane.header=self.basewaypoints.header
+        lane.waypoints=self.base_waypoints.waypoints[closest_idx : closest_idx + LOOKAHEAD_WPS]
+        self.final_waypoints_pub.publish(lane)
+ #final_lane = self.generate_lane()
+ #   self.final_waypoints_pub.publish(final_lane)
 
 
 
@@ -171,7 +171,7 @@ class WaypointUpdater(object):
     def traffic_cb(self, msg):
         # TODO: Callback for /traffic_waypoint message. Implement
         #self.stopline_wp_idx = msg.data
-		pass
+        pass
 
     def obstacle_cb(self, msg):
         # TODO: Callback for /obstacle_waypoint message. We will implement it later
